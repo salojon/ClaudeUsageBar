@@ -1,0 +1,201 @@
+#!/bin/bash
+
+# Claude Usage - Simple terminal command
+# Run: claude-usage
+
+CONFIG_DIR="$HOME/.config/claude-usage"
+TOKEN_FILE="$CONFIG_DIR/token"
+
+# Colors for terminal
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+GREEN='\033[0;32m'
+GRAY='\033[0;90m'
+NC='\033[0m' # No Color
+BOLD='\033[1m'
+
+mkdir -p "$CONFIG_DIR"
+
+# Validate token format (sk-ant-oat or sk-ant-ort followed by version and random string)
+validate_token() {
+    local token="$1"
+    [[ "$token" =~ ^sk-ant-o[ar]t[0-9]{2}-[A-Za-z0-9_-]+$ ]]
+}
+
+# Get token - tries Claude Code keychain first, then manual token file
+get_token() {
+    # Try Claude Code keychain first
+    local creds=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+    if [[ -n "$creds" ]]; then
+        # Extract accessToken using grep and cut
+        local token=$(echo "$creds" | grep -o '"accessToken":"[^"]*"' | cut -d'"' -f4)
+        if [[ -n "$token" ]] && validate_token "$token"; then
+            echo "$token"
+            return
+        fi
+    fi
+
+    # Fall back to manual token file (validate format)
+    if [[ -f "$TOKEN_FILE" ]]; then
+        local token=$(cat "$TOKEN_FILE")
+        if validate_token "$token"; then
+            echo "$token"
+            return
+        fi
+    fi
+}
+
+# Set token (with validation)
+set_token() {
+    local token="$1"
+    if ! validate_token "$token"; then
+        echo "${RED}Invalid token format. Token should start with sk-ant-oat or sk-ant-ort${NC}"
+        exit 1
+    fi
+    # Create file with secure permissions from the start
+    (umask 077 && echo "$token" > "$TOKEN_FILE")
+    echo "Token saved!"
+}
+
+# Format time
+format_time() {
+    local reset_time="$1"
+    local now=$(date +%s)
+
+    # Strip fractional seconds and convert +00:00 to Z for parsing
+    # Input: 2026-03-13T05:00:00.124142+00:00 -> 2026-03-13T05:00:00Z
+    local cleaned=$(echo "$reset_time" | sed -E 's/\.[0-9]+//; s/\+00:00$/Z/')
+    local reset=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$cleaned" +%s 2>/dev/null)
+
+    if [[ -z "$reset" ]]; then
+        echo "unknown"
+        return
+    fi
+
+    local diff=$((reset - now))
+    if [[ $diff -le 0 ]]; then
+        echo "now"
+        return
+    fi
+
+    local days=$((diff / 86400))
+    local hours=$(((diff % 86400) / 3600))
+    local mins=$(((diff % 3600) / 60))
+
+    if [[ $days -gt 0 ]]; then
+        echo "${days}d ${hours}h"
+    elif [[ $hours -gt 0 ]]; then
+        echo "${hours}h ${mins}m"
+    else
+        echo "${mins}m"
+    fi
+}
+
+# Pick color
+pick_color() {
+    local usage=$1
+    if (( $(echo "$usage >= 90" | bc -l) )); then
+        echo "$RED"
+    elif (( $(echo "$usage >= 70" | bc -l) )); then
+        echo "$YELLOW"
+    else
+        echo "$GREEN"
+    fi
+}
+
+# Show usage bar
+show_bar() {
+    local percent=$1
+    local width=20
+    local filled=$((percent * width / 100))
+    local empty=$((width - filled))
+    local color=$(pick_color $percent)
+
+    printf "${color}"
+    printf "%${filled}s" | tr ' ' '█'
+    printf "${GRAY}"
+    printf "%${empty}s" | tr ' ' '░'
+    printf "${NC}"
+}
+
+# Main
+TOKEN=$(get_token)
+
+# Handle arguments
+if [[ "$1" == "login" || "$1" == "set-token" ]]; then
+    echo -n "Paste your OAuth token: "
+    read -s token
+    echo
+    set_token "$token"
+    exit 0
+fi
+
+if [[ "$1" == "logout" ]]; then
+    rm -f "$TOKEN_FILE"
+    echo "Signed out."
+    exit 0
+fi
+
+if [[ -z "$TOKEN" ]]; then
+    echo ""
+    echo "${BOLD}Claude Usage${NC}"
+    echo ""
+    echo "Not signed in. To set up:"
+    echo ""
+    echo "  1. Run 'claude login' in Terminal (if not done)"
+    echo "  2. Open Keychain Access, search 'Claude Code'"
+    echo "  3. Copy the accessToken value"
+    echo "  4. Run: ${BOLD}claude-usage login${NC}"
+    echo ""
+    exit 1
+fi
+
+# Fetch usage (use -K with process substitution to avoid token in process args)
+RESPONSE=$(curl -s -w "\n%{http_code}" \
+    -K <(echo "header = \"Authorization: Bearer $TOKEN\"") \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null)
+
+HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+BODY=$(echo "$RESPONSE" | sed '$d')
+
+if [[ "$HTTP_CODE" != "200" ]]; then
+    if [[ "$HTTP_CODE" == "401" ]]; then
+        echo "${RED}Token expired. Run: claude-usage login${NC}"
+    else
+        echo "${RED}Error fetching usage (HTTP $HTTP_CODE)${NC}"
+    fi
+    exit 1
+fi
+
+# Parse response
+FIVE_HOUR_UTIL=$(echo "$BODY" | grep -o '"five_hour"[^}]*' | grep -o '"utilization":[0-9.]*' | cut -d':' -f2)
+FIVE_HOUR_RESET=$(echo "$BODY" | grep -o '"five_hour"[^}]*' | grep -o '"resets_at":"[^"]*"' | cut -d'"' -f4)
+SEVEN_DAY_UTIL=$(echo "$BODY" | grep -o '"seven_day"[^}]*' | grep -o '"utilization":[0-9.]*' | cut -d':' -f2)
+SEVEN_DAY_RESET=$(echo "$BODY" | grep -o '"seven_day"[^}]*' | grep -o '"resets_at":"[^"]*"' | cut -d'"' -f4)
+
+FIVE_HOUR_PCT=$(printf "%.0f" "$FIVE_HOUR_UTIL")
+SEVEN_DAY_PCT=$(printf "%.0f" "$SEVEN_DAY_UTIL")
+
+FIVE_TIME=$(format_time "$FIVE_HOUR_RESET")
+SEVEN_TIME=$(format_time "$SEVEN_DAY_RESET")
+
+FIVE_COLOR=$(pick_color "$FIVE_HOUR_UTIL")
+SEVEN_COLOR=$(pick_color "$SEVEN_DAY_UTIL")
+
+# Display
+echo ""
+echo "${BOLD}╔══════════════════════════════════╗${NC}"
+echo "${BOLD}║         Claude Usage             ║${NC}"
+echo "${BOLD}╚══════════════════════════════════╝${NC}"
+echo ""
+printf "  Session (5hr):  ${FIVE_COLOR}${BOLD}%3d%%${NC}  " "$FIVE_HOUR_PCT"
+show_bar "$FIVE_HOUR_PCT"
+echo ""
+echo "  ${GRAY}Resets in $FIVE_TIME${NC}"
+echo ""
+printf "  Weekly (7day):  ${SEVEN_COLOR}${BOLD}%3d%%${NC}  " "$SEVEN_DAY_PCT"
+show_bar "$SEVEN_DAY_PCT"
+echo ""
+echo "  ${GRAY}Resets in $SEVEN_TIME${NC}"
+echo ""
