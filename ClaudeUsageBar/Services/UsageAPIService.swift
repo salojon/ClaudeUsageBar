@@ -165,6 +165,7 @@ final class UsageAPIService: ObservableObject {
     private var refreshTimer: Timer?
     private let urlSession: URLSession
     private let rateLimiter = RateLimiter()
+    private var isRefreshingToken = false
 
     private init() {
         // Create URLSession with certificate pinning delegate
@@ -263,15 +264,19 @@ final class UsageAPIService: ObservableObject {
                 if httpResponse.statusCode == 401 {
                     // Token expired or invalid
                     if !isRetry {
-                        // Try to get fresh token from Claude Code before giving up
+                        // First, try to refresh using the stored refresh token
+                        if await refreshClaudeCodeToken() {
+                            await fetchUsageInternal(isRetry: true)
+                            return
+                        }
+                        // Fall back: check if Claude Code already refreshed the token externally
                         if let freshToken = KeychainService.shared.readClaudeCodeToken(),
                            freshToken != token {
-                            // Got a different (hopefully refreshed) token, retry once
                             await fetchUsageInternal(isRetry: true)
                             return
                         }
                     }
-                    // No fresh token available or retry also failed
+                    // Refresh failed or retry also failed — require re-login
                     isSignedIn = false
                     isSyncedFromClaudeCode = false
                     try? KeychainService.shared.deleteAppToken()
@@ -295,6 +300,57 @@ final class UsageAPIService: ObservableObject {
         }
 
         isLoading = false
+    }
+
+    /// Refreshes the Claude Code OAuth access token using the stored refresh token.
+    /// On success, writes the new access token and refresh token back to Claude Code's keychain entry.
+    private func refreshClaudeCodeToken() async -> Bool {
+        guard !isRefreshingToken else { return false }
+        isRefreshingToken = true
+        defer { isRefreshingToken = false }
+
+        guard let refreshToken = KeychainService.shared.readClaudeCodeRefreshToken() else {
+            return false
+        }
+
+        let refreshURL = URL(string: "https://claude.ai/api/auth/oauth/token")!
+        var request = URLRequest(url: refreshURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body: [String: String] = [
+            "grant_type": "refresh_token",
+            "refresh_token": refreshToken,
+            "client_id": "claude_code_cli"
+        ]
+
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
+            return false
+        }
+        request.httpBody = bodyData
+
+        do {
+            let (data, response) = try await urlSession.data(for: request)
+
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200 else {
+                return false
+            }
+
+            guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let newAccessToken = json["access_token"] as? String,
+                  let newRefreshToken = json["refresh_token"] as? String else {
+                return false
+            }
+
+            try KeychainService.shared.updateClaudeCodeTokens(
+                accessToken: newAccessToken,
+                refreshToken: newRefreshToken
+            )
+            return true
+        } catch {
+            return false
+        }
     }
 
     /// Validates a token by making an API call, then stores it only if valid

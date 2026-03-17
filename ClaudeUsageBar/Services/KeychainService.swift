@@ -23,10 +23,8 @@ final class KeychainService {
 
     private init() {}
 
-    /// Reads OAuth token directly from Claude Code's keychain entry
-    /// This allows automatic token sync without manual copy/paste
-    /// Security: Reads directly via Security framework instead of shelling out
-    func readClaudeCodeToken() -> String? {
+    /// Reads the full Claude Code credentials JSON from keychain
+    private func readClaudeCodeCredentials() -> [String: Any]? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
@@ -39,25 +37,63 @@ final class KeychainService {
 
         guard status == errSecSuccess,
               let data = result as? Data,
-              let jsonString = String(data: data, encoding: .utf8) else {
+              let jsonData = String(data: data, encoding: .utf8)?.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
             return nil
         }
 
-        // Parse JSON to extract accessToken
-        // Expected format: {"claudeAiOauth":{"accessToken":"sk-ant-...","refreshToken":"..."}}
-        guard let jsonData = jsonString.data(using: .utf8),
-              let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+        return json
+    }
+
+    /// Reads OAuth token directly from Claude Code's keychain entry
+    /// This allows automatic token sync without manual copy/paste
+    /// Security: Reads directly via Security framework instead of shelling out
+    func readClaudeCodeToken() -> String? {
+        guard let json = readClaudeCodeCredentials(),
               let claudeAiOauth = json["claudeAiOauth"] as? [String: Any],
-              let accessToken = claudeAiOauth["accessToken"] as? String else {
+              let accessToken = claudeAiOauth["accessToken"] as? String,
+              isValidTokenFormat(accessToken) else {
             return nil
         }
-
-        // Validate token format (should start with sk-ant-)
-        guard isValidTokenFormat(accessToken) else {
-            return nil
-        }
-
         return accessToken
+    }
+
+    /// Reads the refresh token from Claude Code's keychain entry
+    func readClaudeCodeRefreshToken() -> String? {
+        guard let json = readClaudeCodeCredentials(),
+              let claudeAiOauth = json["claudeAiOauth"] as? [String: Any],
+              let refreshToken = claudeAiOauth["refreshToken"] as? String else {
+            return nil
+        }
+        return refreshToken
+    }
+
+    /// Updates Claude Code's keychain entry with a refreshed access token and new refresh token.
+    /// Preserves all other fields in the credentials JSON.
+    func updateClaudeCodeTokens(accessToken: String, refreshToken: String) throws {
+        guard var json = readClaudeCodeCredentials(),
+              var claudeAiOauth = json["claudeAiOauth"] as? [String: Any] else {
+            throw KeychainError.itemNotFound
+        }
+
+        claudeAiOauth["accessToken"] = accessToken
+        claudeAiOauth["refreshToken"] = refreshToken
+        json["claudeAiOauth"] = claudeAiOauth
+
+        guard let updatedData = try? JSONSerialization.data(withJSONObject: json) else {
+            throw KeychainError.unexpectedData
+        }
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "Claude Code-credentials"
+        ]
+        let attributes: [String: Any] = [kSecValueData as String: updatedData]
+
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        guard status == errSecSuccess else {
+            throw KeychainError.unhandledError(status: status)
+        }
     }
 
     /// Validates OAuth token format
