@@ -196,8 +196,8 @@ final class UsageAPIService: ObservableObject {
                 self.rateLimitedUntil = nil
                 // Give the network 3 seconds to come up, then force a refresh
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
-                _ = await self.refreshClaudeCodeToken()
-                await self.fetchUsage()
+                let freshToken = await self.refreshClaudeCodeToken()
+                await self.fetchUsageInternal(token: freshToken)
             }
         }
     }
@@ -245,30 +245,34 @@ final class UsageAPIService: ObservableObject {
     }
 
     func fetchUsage() async {
-        await fetchUsageInternal(isRetry: false)
+        await fetchUsageInternal(token: nil)
     }
 
-    private func fetchUsageInternal(isRetry: Bool) async {
+    private func fetchUsageInternal(token overrideToken: String?) async {
         // Skip if we're still in a 429 rate-limit cooldown
         if let until = rateLimitedUntil, Date() < until {
             return
         }
 
-        // Try Claude Code token first, then fall back to app's token
-        let claudeCodeToken = KeychainService.shared.readClaudeCodeToken()
-        let appToken = KeychainService.shared.readAppToken()
-        let token = claudeCodeToken ?? appToken
-
-        guard let token = token else {
-            error = .noToken
-            isSignedIn = false
-            isSyncedFromClaudeCode = false
-            isLoading = false
-            return
+        // Use override token (from a just-refreshed token) or read from keychain
+        let token: String
+        let usingClaudeCodeToken: Bool
+        if let override = overrideToken {
+            token = override
+            usingClaudeCodeToken = true
+        } else {
+            let claudeCodeToken = KeychainService.shared.readClaudeCodeToken()
+            let appToken = KeychainService.shared.readAppToken()
+            guard let resolved = claudeCodeToken ?? appToken else {
+                error = .noToken
+                isSignedIn = false
+                isSyncedFromClaudeCode = false
+                isLoading = false
+                return
+            }
+            token = resolved
+            usingClaudeCodeToken = claudeCodeToken != nil
         }
-
-        // Track which token source we're using
-        let usingClaudeCodeToken = claudeCodeToken != nil
 
         isLoading = true
         error = nil
@@ -297,22 +301,13 @@ final class UsageAPIService: ObservableObject {
                     rateLimitedUntil = Date().addingTimeInterval(retryAfter)
                     throw APIError.rateLimited
                 }
-                if httpResponse.statusCode == 401 {
-                    // Token expired or invalid
-                    if !isRetry {
-                        // First, try to refresh using the stored refresh token
-                        if await refreshClaudeCodeToken() {
-                            await fetchUsageInternal(isRetry: true)
-                            return
-                        }
-                        // Fall back: check if Claude Code already refreshed the token externally
-                        if let freshToken = KeychainService.shared.readClaudeCodeToken(),
-                           freshToken != token {
-                            await fetchUsageInternal(isRetry: true)
-                            return
-                        }
+                if httpResponse.statusCode == 401 && overrideToken == nil {
+                    // Token expired — try to refresh via stored refresh token
+                    if let freshToken = await refreshClaudeCodeToken() {
+                        await fetchUsageInternal(token: freshToken)
+                        return
                     }
-                    // Refresh failed or retry also failed — require re-login
+                    // Refresh failed — require re-login
                     isSignedIn = false
                     isSyncedFromClaudeCode = false
                     try? KeychainService.shared.deleteAppToken()
@@ -339,14 +334,16 @@ final class UsageAPIService: ObservableObject {
     }
 
     /// Refreshes the Claude Code OAuth access token using the stored refresh token.
-    /// On success, writes the new access token and refresh token back to Claude Code's keychain entry.
-    private func refreshClaudeCodeToken() async -> Bool {
-        guard !isRefreshingToken else { return false }
+    /// Returns the new access token on success, or nil on failure.
+    /// Best-effort writes the new tokens back to Claude Code's keychain entry (may fail due to ACL).
+    @discardableResult
+    private func refreshClaudeCodeToken() async -> String? {
+        guard !isRefreshingToken else { return nil }
         isRefreshingToken = true
         defer { isRefreshingToken = false }
 
         guard let refreshToken = KeychainService.shared.readClaudeCodeRefreshToken() else {
-            return false
+            return nil
         }
 
         let refreshURL = URL(string: "https://claude.ai/api/auth/oauth/token")!
@@ -361,31 +358,32 @@ final class UsageAPIService: ObservableObject {
         ]
 
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
-            return false
+            return nil
         }
         request.httpBody = bodyData
 
         do {
-            let (data, response) = try await urlSession.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: request)
 
             guard let httpResponse = response as? HTTPURLResponse,
                   httpResponse.statusCode == 200 else {
-                return false
+                return nil
             }
 
             guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let newAccessToken = json["access_token"] as? String,
                   let newRefreshToken = json["refresh_token"] as? String else {
-                return false
+                return nil
             }
 
-            try KeychainService.shared.updateClaudeCodeTokens(
+            // Best-effort: write back to Claude Code's keychain entry (may fail due to ACL)
+            try? KeychainService.shared.updateClaudeCodeTokens(
                 accessToken: newAccessToken,
                 refreshToken: newRefreshToken
             )
-            return true
+            return newAccessToken
         } catch {
-            return false
+            return nil
         }
     }
 
