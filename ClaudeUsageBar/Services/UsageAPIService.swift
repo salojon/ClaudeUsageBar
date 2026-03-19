@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import CryptoKit
+import AppKit
 
 enum APIError: Error, LocalizedError {
     case noToken
@@ -166,6 +167,7 @@ final class UsageAPIService: ObservableObject {
     private let urlSession: URLSession
     private let rateLimiter = RateLimiter()
     private var isRefreshingToken = false
+    private var rateLimitedUntil: Date?
 
     private init() {
         // Create URLSession with certificate pinning delegate
@@ -179,6 +181,23 @@ final class UsageAPIService: ObservableObject {
         SettingsService.shared.onRefreshIntervalChanged = { [weak self] in
             Task { @MainActor [weak self] in
                 self?.restartAutoRefresh()
+            }
+        }
+
+        // Refresh token and re-fetch after wake from sleep
+        NotificationCenter.default.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // Clear any stale rate-limit cooldown from before sleep
+                self.rateLimitedUntil = nil
+                // Give the network 3 seconds to come up, then force a refresh
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                _ = await self.refreshClaudeCodeToken()
+                await self.fetchUsage()
             }
         }
     }
@@ -230,6 +249,11 @@ final class UsageAPIService: ObservableObject {
     }
 
     private func fetchUsageInternal(isRetry: Bool) async {
+        // Skip if we're still in a 429 rate-limit cooldown
+        if let until = rateLimitedUntil, Date() < until {
+            return
+        }
+
         // Try Claude Code token first, then fall back to app's token
         let claudeCodeToken = KeychainService.shared.readClaudeCodeToken()
         let appToken = KeychainService.shared.readAppToken()
@@ -261,6 +285,18 @@ final class UsageAPIService: ObservableObject {
             }
 
             guard httpResponse.statusCode == 200 else {
+                if httpResponse.statusCode == 429 {
+                    // Respect Retry-After header; default to 60s
+                    let retryAfter: TimeInterval
+                    if let header = httpResponse.value(forHTTPHeaderField: "Retry-After"),
+                       let seconds = TimeInterval(header) {
+                        retryAfter = seconds
+                    } else {
+                        retryAfter = 60
+                    }
+                    rateLimitedUntil = Date().addingTimeInterval(retryAfter)
+                    throw APIError.rateLimited
+                }
                 if httpResponse.statusCode == 401 {
                     // Token expired or invalid
                     if !isRetry {
