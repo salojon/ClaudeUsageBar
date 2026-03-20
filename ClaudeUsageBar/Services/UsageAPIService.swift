@@ -192,12 +192,16 @@ final class UsageAPIService: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                // Clear any stale rate-limit cooldown from before sleep
-                self.rateLimitedUntil = nil
+                // Stop the timer so it doesn't race with this wake handler and cause a 429
+                self.stopAutoRefresh()
                 // Give the network 3 seconds to come up, then force a refresh
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
+                // Clear rate-limit cooldown after the wait so the timer can't re-set it during sleep
+                self.rateLimitedUntil = nil
                 let freshToken = await self.refreshClaudeCodeToken()
                 await self.fetchUsageInternal(token: freshToken)
+                // Restart periodic refresh
+                self.startAutoRefresh()
             }
         }
     }
