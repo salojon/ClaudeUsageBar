@@ -29,7 +29,9 @@ final class KeychainService {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: "Claude Code-credentials",
             kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
+            kSecMatchLimit as String: kSecMatchLimitOne,
+            // Fail silently instead of prompting with a password dialog if the item is ACL-protected
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
         ]
 
         var result: AnyObject?
@@ -86,7 +88,8 @@ final class KeychainService {
 
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials"
+            kSecAttrService as String: "Claude Code-credentials",
+            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
         ]
         let attributes: [String: Any] = [kSecValueData as String: updatedData]
 
