@@ -12,6 +12,7 @@ final class KeychainService {
 
     private let appService = "ClaudeUsageBar-token"
     private let account = "oauth-token"
+    private let refreshTokenAccount = "oauth-refresh-token"
 
     // Keychain access group - must match entitlements
     // Format: $(AppIdentifierPrefix)bundleIdentifier
@@ -70,33 +71,22 @@ final class KeychainService {
         return refreshToken
     }
 
-    /// Updates Claude Code's keychain entry with a refreshed access token and new refresh token.
-    /// Preserves all other fields in the credentials JSON.
-    func updateClaudeCodeTokens(accessToken: String, refreshToken: String) throws {
-        guard var json = readClaudeCodeCredentials(),
-              var claudeAiOauth = json["claudeAiOauth"] as? [String: Any] else {
-            throw KeychainError.itemNotFound
+    /// Reads the refresh token — our own cached copy first, then Claude Code's keychain as fallback.
+    /// Never writes to Claude Code's keychain to avoid ACL prompts.
+    func readRefreshToken() -> String? {
+        // Prefer our own cached refresh token (written without ACL prompts)
+        if let data = try? readKeychainData(account: refreshTokenAccount),
+           let token = String(data: data, encoding: .utf8) {
+            return token
         }
+        // Fall back to Claude Code's keychain (read-only, fail silently if ACL-blocked)
+        return readClaudeCodeRefreshToken()
+    }
 
-        claudeAiOauth["accessToken"] = accessToken
-        claudeAiOauth["refreshToken"] = refreshToken
-        json["claudeAiOauth"] = claudeAiOauth
-
-        guard let updatedData = try? JSONSerialization.data(withJSONObject: json) else {
-            throw KeychainError.unexpectedData
-        }
-
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "Claude Code-credentials",
-            kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
-        ]
-        let attributes: [String: Any] = [kSecValueData as String: updatedData]
-
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        guard status == errSecSuccess else {
-            throw KeychainError.unhandledError(status: status)
-        }
+    /// Saves a refreshed token pair into our own app keychain — never touches Claude Code's keychain.
+    func saveRefreshedTokens(accessToken: String, refreshToken: String) throws {
+        try saveAppToken(accessToken)
+        try saveKeychainData(refreshToken.data(using: .utf8)!, account: refreshTokenAccount)
     }
 
     /// Validates OAuth token format
@@ -173,11 +163,11 @@ final class KeychainService {
         }
     }
 
-    private func readKeychainData() throws -> Data {
+    private func readKeychainData(account: String? = nil) throws -> Data {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: appService,
-            kSecAttrAccount as String: account,
+            kSecAttrAccount as String: account ?? self.account,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
@@ -201,5 +191,32 @@ final class KeychainService {
         }
 
         return data
+    }
+
+    private func saveKeychainData(_ data: Data, account: String) throws {
+        // Delete existing first
+        let deleteQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: appService,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(deleteQuery as CFDictionary)
+
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: appService,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecAttrSynchronizable as String: false
+        ]
+        if let group = accessGroup {
+            query[kSecAttrAccessGroup as String] = group
+        }
+
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw KeychainError.unhandledError(status: status)
+        }
     }
 }

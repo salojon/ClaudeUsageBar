@@ -337,16 +337,15 @@ final class UsageAPIService: ObservableObject {
         isLoading = false
     }
 
-    /// Refreshes the Claude Code OAuth access token using the stored refresh token.
-    /// Returns the new access token on success, or nil on failure.
-    /// Best-effort writes the new tokens back to Claude Code's keychain entry (may fail due to ACL).
+    /// Refreshes the OAuth access token using the stored refresh token.
+    /// Stores refreshed tokens in our own keychain — never touches Claude Code's keychain.
     @discardableResult
     private func refreshClaudeCodeToken() async -> String? {
         guard !isRefreshingToken else { return nil }
         isRefreshingToken = true
         defer { isRefreshingToken = false }
 
-        guard let refreshToken = KeychainService.shared.readClaudeCodeRefreshToken() else {
+        guard let refreshToken = KeychainService.shared.readRefreshToken() else {
             return nil
         }
 
@@ -380,8 +379,8 @@ final class UsageAPIService: ObservableObject {
                 return nil
             }
 
-            // Best-effort: write back to Claude Code's keychain entry (may fail due to ACL)
-            try? KeychainService.shared.updateClaudeCodeTokens(
+            // Store in our own keychain — never write to Claude Code's keychain (triggers ACL prompts)
+            try? KeychainService.shared.saveRefreshedTokens(
                 accessToken: newAccessToken,
                 refreshToken: newRefreshToken
             )
