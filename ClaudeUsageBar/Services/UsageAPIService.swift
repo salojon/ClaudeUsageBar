@@ -258,24 +258,35 @@ final class UsageAPIService: ObservableObject {
             return
         }
 
-        // Use override token (from a just-refreshed token) or read from keychain
+        // Use override token (from a just-refreshed token) or read from keychain.
+        // Prefer our own app token to avoid reading Claude Code's keychain on every poll
+        // (which prompts for login keychain password when the keychain is locked after sleep).
+        // Only read Claude Code's keychain when we have no token of our own.
         let token: String
         let usingClaudeCodeToken: Bool
         if let override = overrideToken {
             token = override
             usingClaudeCodeToken = true
-        } else {
-            let claudeCodeToken = KeychainService.shared.readClaudeCodeToken()
-            let appToken = KeychainService.shared.readAppToken()
-            guard let resolved = claudeCodeToken ?? appToken else {
-                error = .noToken
-                isSignedIn = false
-                isSyncedFromClaudeCode = false
-                isLoading = false
-                return
+        } else if let appToken = KeychainService.shared.readAppToken() {
+            token = appToken
+            usingClaudeCodeToken = false
+        } else if let claudeCodeToken = KeychainService.shared.readClaudeCodeToken() {
+            // First-time bootstrap from Claude Code's keychain — cache refresh token so we
+            // don't need to read Claude Code's keychain again after our first token refresh.
+            if let refreshToken = KeychainService.shared.readClaudeCodeRefreshToken() {
+                try? KeychainService.shared.saveRefreshedTokens(
+                    accessToken: claudeCodeToken,
+                    refreshToken: refreshToken
+                )
             }
-            token = resolved
-            usingClaudeCodeToken = claudeCodeToken != nil
+            token = claudeCodeToken
+            usingClaudeCodeToken = true
+        } else {
+            error = .noToken
+            isSignedIn = false
+            isSyncedFromClaudeCode = false
+            isLoading = false
+            return
         }
 
         isLoading = true
