@@ -168,6 +168,9 @@ final class UsageAPIService: ObservableObject {
     private let rateLimiter = RateLimiter()
     private var isRefreshingToken = false
     private var rateLimitedUntil: Date?
+    /// In-memory token cache — avoids reading from keychain on every poll,
+    /// which prevents login-keychain-password popups when the keychain is locked after sleep.
+    private var cachedToken: String?
 
     private init() {
         // Create URLSession with certificate pinning delegate
@@ -200,8 +203,8 @@ final class UsageAPIService: ObservableObject {
                 self.rateLimitedUntil = nil
                 let freshToken = await self.refreshClaudeCodeToken()
                 await self.fetchUsageInternal(token: freshToken)
-                // Restart periodic refresh
-                self.startAutoRefresh()
+                // Restart periodic refresh — skip immediate fetch since we just fetched above
+                self.startAutoRefresh(fetchImmediately: false)
             }
         }
     }
@@ -213,13 +216,13 @@ final class UsageAPIService: ObservableObject {
     }
 
     func checkAuthStatus() {
-        // Check Claude Code token first, then app token
-        if KeychainService.shared.readClaudeCodeToken() != nil {
-            isSignedIn = true
-            isSyncedFromClaudeCode = true
-        } else if KeychainService.shared.readAppToken() != nil {
+        // Prefer our own cached token, then our own keychain, then Claude Code's keychain as last resort
+        if cachedToken != nil || KeychainService.shared.readAppToken() != nil {
             isSignedIn = true
             isSyncedFromClaudeCode = false
+        } else if KeychainService.shared.readClaudeCodeToken() != nil {
+            isSignedIn = true
+            isSyncedFromClaudeCode = true
         } else {
             isSignedIn = false
             isSyncedFromClaudeCode = false
@@ -227,14 +230,16 @@ final class UsageAPIService: ObservableObject {
     }
 
     func startAutoRefresh() {
+        startAutoRefresh(fetchImmediately: true)
+    }
+
+    private func startAutoRefresh(fetchImmediately: Bool) {
         stopAutoRefresh()
 
-        // Fetch immediately
-        Task {
-            await fetchUsage()
+        if fetchImmediately {
+            Task { await fetchUsage() }
         }
 
-        // Set up timer for periodic refresh
         let interval = SettingsService.shared.refreshInterval.seconds
         refreshTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
@@ -258,21 +263,23 @@ final class UsageAPIService: ObservableObject {
             return
         }
 
-        // Use override token (from a just-refreshed token) or read from keychain.
-        // Prefer our own app token to avoid reading Claude Code's keychain on every poll
-        // (which prompts for login keychain password when the keychain is locked after sleep).
-        // Only read Claude Code's keychain when we have no token of our own.
+        // Resolve token: in-memory cache → our own keychain → Claude Code's keychain (bootstrap only).
+        // The memory cache is the key: after the first successful fetch the token lives in memory,
+        // so subsequent polls never touch the keychain and never trigger the password popup.
         let token: String
         let usingClaudeCodeToken: Bool
         if let override = overrideToken {
             token = override
             usingClaudeCodeToken = true
+        } else if let cached = cachedToken {
+            token = cached
+            usingClaudeCodeToken = false
         } else if let appToken = KeychainService.shared.readAppToken() {
             token = appToken
             usingClaudeCodeToken = false
         } else if let claudeCodeToken = KeychainService.shared.readClaudeCodeToken() {
-            // First-time bootstrap from Claude Code's keychain — cache refresh token so we
-            // don't need to read Claude Code's keychain again after our first token refresh.
+            // One-time bootstrap from Claude Code's keychain. Cache refresh token immediately so
+            // after the first token refresh we never need Claude Code's keychain again.
             if let refreshToken = KeychainService.shared.readClaudeCodeRefreshToken() {
                 try? KeychainService.shared.saveRefreshedTokens(
                     accessToken: claudeCodeToken,
@@ -325,6 +332,7 @@ final class UsageAPIService: ObservableObject {
                     // Refresh failed — require re-login
                     isSignedIn = false
                     isSyncedFromClaudeCode = false
+                    cachedToken = nil
                     try? KeychainService.shared.deleteAppToken()
                 }
                 throw APIError.httpError(statusCode: httpResponse.statusCode)
@@ -338,6 +346,7 @@ final class UsageAPIService: ObservableObject {
             self.lastUpdated = Date()
             self.isSignedIn = true
             self.isSyncedFromClaudeCode = usingClaudeCodeToken
+            self.cachedToken = token  // cache so subsequent polls skip keychain entirely
 
         } catch let apiError as APIError {
             self.error = apiError
@@ -504,6 +513,7 @@ final class UsageAPIService: ObservableObject {
     }
 
     func signOut() {
+        cachedToken = nil
         try? KeychainService.shared.deleteAppToken()
         usageData = nil
         lastUpdated = nil
