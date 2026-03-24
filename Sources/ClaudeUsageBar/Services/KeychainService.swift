@@ -4,6 +4,7 @@ import Foundation
 enum KeychainService {
     private static let appService = "ClaudeUsageBar"
     private static let appAccount = "oauth-token"
+    private static let apiKeyAccount = "api-key"
     private static let claudeCodeService = "Claude Code-credentials"
 
     // MARK: - App's own token storage
@@ -41,6 +42,45 @@ enum KeychainService {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: appService,
             kSecAttrAccount as String: appAccount
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+
+    // MARK: - Personal API Key storage
+
+    static func readAPIKey() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: appService,
+            kSecAttrAccount as String: apiKeyAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data,
+              let token = String(data: data, encoding: .utf8) else { return nil }
+        return token
+    }
+
+    static func saveAPIKey(_ token: String) {
+        guard let data = token.data(using: .utf8) else { return }
+        deleteAPIKey()
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: appService,
+            kSecAttrAccount as String: apiKeyAccount,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock
+        ]
+        SecItemAdd(query as CFDictionary, nil)
+    }
+
+    static func deleteAPIKey() {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: appService,
+            kSecAttrAccount as String: apiKeyAccount
         ]
         SecItemDelete(query as CFDictionary)
     }

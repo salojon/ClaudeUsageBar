@@ -12,11 +12,16 @@ class AppState: ObservableObject {
     @Published var isLoading: Bool = false
     @Published var error: String?
     @Published var launchAtLogin: Bool = false
+    @Published var refreshInterval: Int = 10 {
+        didSet {
+            SettingsService.saveRefreshInterval(refreshInterval)
+            restartTimer()
+        }
+    }
 
-    // No cached token — always read fresh from Claude Code's Keychain so we
-    // automatically pick up any token Claude Code refreshes behind the scenes.
-    private var manualToken: String?   // only set when user pastes a token manually
+    private var manualToken: String?
     private var refreshTimer: Timer?
+    private var retryTimer: Timer?
 
     var statusColor: Color {
         let max = Swift.max(sessionUtilization ?? 0, weeklyUtilization ?? 0)
@@ -27,18 +32,32 @@ class AppState: ObservableObject {
 
     init() {
         launchAtLogin = LaunchAtLoginService.isEnabled
-        manualToken = KeychainService.readAppToken()
-        isSignedIn = currentToken != nil
-        if isSignedIn {
-            Task { await fetchUsage() }
+        refreshInterval = SettingsService.readRefreshInterval()
+
+        // Try to read stored or Claude Code token
+        if let savedToken = KeychainService.readAppToken() {
+            manualToken = savedToken
+            isSignedIn = true
+        } else if KeychainService.readClaudeCodeToken() != nil {
+            isSignedIn = true
+        } else {
+            isSignedIn = false
         }
+
         startTimer()
+
+        // Fetch on startup after a brief delay (allows app to fully initialize)
+        if isSignedIn {
+            Task {
+                try? await Task.sleep(nanoseconds: 500_000_000)  // 0.5 second delay
+                await self.fetchUsage()
+            }
+        }
     }
 
-    /// Always returns the freshest available token.
-    /// Prefers Claude Code's Keychain (auto-refreshed by Claude Code) over a manually stored token.
+    /// Prefer personal API key, then app's stored token, then Claude Code's token
     private var currentToken: String? {
-        KeychainService.readClaudeCodeToken() ?? manualToken
+        KeychainService.readAPIKey() ?? manualToken ?? KeychainService.readClaudeCodeToken()
     }
 
     func signIn(token: String) {
@@ -64,33 +83,52 @@ class AppState: ObservableObject {
     }
 
     func fetchUsage() async {
-        // Read fresh token every time — Claude Code refreshes it automatically
-        guard let token = currentToken else {
-            isSignedIn = false
+        // Prevent rapid-fire requests (enforce 1 hour minimum between fetches)
+        if let lastUpdated, Date().timeIntervalSince(lastUpdated) < 3600 {
             return
         }
-        isSignedIn = true
+
         isLoading = true
         error = nil
+
         do {
-            let usage = try await UsageAPIService.fetchUsage(token: token)
-            sessionUtilization = usage.fiveHour.utilization
-            sessionResetsAt = usage.fiveHour.resetsAt
-            weeklyUtilization = usage.sevenDay.utilization
-            weeklyResetsAt = usage.sevenDay.resetsAt
-            lastUpdated = Date()
-        } catch APIError.unauthorized {
-            // Token truly invalid — try one more fresh read in case Claude Code
-            // just refreshed it between our read and the API call
-            if let freshToken = currentToken, freshToken != token {
-                _ = try? await UsageAPIService.fetchUsage(token: freshToken)
+            // Try OAuth token first (from Claude Code keychain)
+            if let token = KeychainService.readClaudeCodeToken() {
+                let usage = try await UsageAPIService.fetchUsage(token: token)
+                sessionUtilization = usage.fiveHour.utilization
+                sessionResetsAt = usage.fiveHour.resetsAt
+                weeklyUtilization = usage.sevenDay.utilization
+                weeklyResetsAt = usage.sevenDay.resetsAt
+                lastUpdated = Date()
+                isSignedIn = true
+                error = nil
+            } else if let token = manualToken ?? KeychainService.readAppToken() {
+                let usage = try await UsageAPIService.fetchUsage(token: token)
+                sessionUtilization = usage.fiveHour.utilization
+                sessionResetsAt = usage.fiveHour.resetsAt
+                weeklyUtilization = usage.sevenDay.utilization
+                weeklyResetsAt = usage.sevenDay.resetsAt
+                lastUpdated = Date()
+                isSignedIn = true
+                error = nil
             } else {
-                error = "Session expired. Please run `claude login` in Terminal."
+                isSignedIn = false
+                error = "No token found. Run 'claude login' first."
             }
-        } catch {
-            self.error = error.localizedDescription
+        } catch APIError.rateLimited {
+            // Just show a message, don't clear previous data
+            error = "Rate limited. Last update: \(formatLastUpdate())"
+        } catch let err {
+            error = "Unable to fetch: \(err.localizedDescription)"
         }
         isLoading = false
+    }
+
+    private func formatLastUpdate() -> String {
+        guard let lastUpdated else { return "never" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: lastUpdated, relativeTo: Date())
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -99,10 +137,25 @@ class AppState: ObservableObject {
     }
 
     private func startTimer() {
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: true) { [weak self] _ in
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: Double(refreshInterval * 60), repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
                 guard self.isSignedIn else { return }
+                await self.fetchUsage()
+            }
+        }
+    }
+
+    private func restartTimer() {
+        refreshTimer?.invalidate()
+        startTimer()
+    }
+
+    private func startRetryTimer() {
+        retryTimer?.invalidate()
+        retryTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
                 await self.fetchUsage()
             }
         }

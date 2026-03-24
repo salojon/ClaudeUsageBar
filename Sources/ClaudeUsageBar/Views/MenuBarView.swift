@@ -88,6 +88,22 @@ struct MenuBarView: View {
             Divider()
                 .padding(.bottom, 10)
 
+            // Refresh interval picker
+            HStack {
+                Text("Check every")
+                    .font(.callout)
+                Spacer()
+                Picker("Refresh Interval", selection: $appState.refreshInterval) {
+                    Text("1 min").tag(1)
+                    Text("5 min").tag(5)
+                    Text("10 min").tag(10)
+                    Text("30 min").tag(30)
+                }
+                .pickerStyle(.segmented)
+                .font(.caption)
+            }
+            .padding(.bottom, 8)
+
             // Launch at Login toggle
             Toggle("Launch at Login", isOn: Binding(
                 get: { appState.launchAtLogin },
@@ -116,6 +132,6 @@ struct MenuBarView: View {
             }
         }
         .padding(16)
-        .frame(width: 280)
+        .frame(width: 340)
     }
 }
